@@ -3,7 +3,9 @@
 #include "qdsssp/filter_icon.h"
 #include "../src/response_path.h"
 #include "../src/overlay_region.h"
+#include "../src/spectrum_fft.h"
 #include <QPainter>
+#include <QPaintEvent>
 #include <QtTest>
 #include <QSignalSpy>
 #include <QTemporaryFile>
@@ -16,6 +18,15 @@
 #include <thread>
 
 using namespace qdsssp;
+class DamageTrackingWidget : public EqWidget {
+public:
+    QRegion damage;
+protected:
+    void paintEvent(QPaintEvent *event) override {
+        damage+=event->region();
+        EqWidget::paintEvent(event);
+    }
+};
 class Tests : public QObject {
     Q_OBJECT
 private slots:
@@ -353,6 +364,54 @@ private slots:
         QCOMPARE(widget.profile()->phases[FrameProfile::Controls].count,quint64(0));
         widget.stopProfiling();
     }
+    void spectrumDamageCoversEveryChangedPixel() {
+        DamageTrackingWidget widget; widget.resize(800,480);
+        widget.setBands({Band{}}); widget.show();
+        auto mailbox=widget.spectrumInput();
+        std::array<float,2049> bins; bins.fill(-85);
+        bins[70]=-50;
+        QVERIFY(mailbox->publish(bins.data(),int(bins.size()),48000));
+        QTest::qWait(180);
+        auto previous=widget.grab().toImage();
+        widget.damage=QRegion();
+        auto verify=[&] {
+            // Capture scheduled damage before grab() requests a full paint.
+            // An incomplete partial update would leave pixels from previous.
+            const auto damage=widget.damage;
+            const auto next=widget.grab().toImage();
+            int changed=0;
+            const double dpr=next.devicePixelRatioF();
+            for (int y=0;y<next.height();++y) for (int x=0;x<next.width();++x) {
+                if (previous.pixel(x,y)==next.pixel(x,y)) continue;
+                ++changed;
+                QVERIFY2(damage.contains(QPoint(int(x/dpr),int(y/dpr))),
+                         "Spectrum repaint region missed a changed pixel");
+            }
+            QVERIFY(changed>0);
+            previous=next; widget.damage=QRegion();
+        };
+        bins.fill(-65); bins[110]=-40;
+        QVERIFY(mailbox->publish(bins.data(),int(bins.size()),48000));
+        QTest::qWait(60);
+        // A trace away from the top/bottom should not repaint the whole plot.
+        QVERIFY(widget.damage.boundingRect().height()<widget.plotRect().height());
+        verify();
+        widget.setSpectrumFillEnabled(true); QTest::qWait(60); verify();
+        bins.fill(-70); bins[200]=-35;
+        QVERIFY(mailbox->publish(bins.data(),int(bins.size()),48000));
+        QTest::qWait(60); verify();
+        widget.setSpectrumFillEnabled(false); QTest::qWait(60); verify();
+        // Returning to the floor, including release after an input expires,
+        // must erase every old peak without leaving stray pixels.
+        bins.fill(-120);
+        QVERIFY(mailbox->publish(bins.data(),int(bins.size()),48000));
+        QTest::qWait(70); verify();
+        QTest::qWait(300); verify();
+        widget.setSpectrumEnabled(false); QTest::qWait(70); verify();
+        widget.setSpectrumEnabled(true); bins.fill(-80); bins[10]=-2;
+        QVERIFY(mailbox->publish(bins.data(),int(bins.size()),48000));
+        QTest::qWait(70); verify();
+    }
     void pcmFileSourcePublishesMeasuredFrames() {
         QTemporaryFile pcm;
         QVERIFY(pcm.open());
@@ -393,6 +452,61 @@ private slots:
         QVERIFY(stats.fftFrames > 0);
         QVERIFY(stats.publishedFrames > 0);
         QVERIFY(stats.fftNanoseconds >= stats.fftMaxNanoseconds);
+    }
+    void realFftMatchesIndependentDft() {
+        constexpr double pi = 3.14159265358979323846;
+        for (int n = 256; n <= 16384; n *= 2) {
+            detail::SpectrumFft fft(n);
+            std::vector<float> samples(n), circular(n), db;
+            std::uint32_t random = 12345;
+            for (int i = 0; i < n; ++i) {
+                random = 1664525 * random + 1013904223;
+                samples[i] = float(0.1 + 0.2 * std::sin(2 * pi * 7.3 * i / n) +
+                                   0.1 * (i % 2 ? -1 : 1) +
+                                   0.1 * (double(random) / 4294967296.0 - 0.5));
+            }
+            std::vector<double> expected(n / 2 + 1, 0);
+            std::vector<int> bins;
+            if (n <= 512) {
+                for (int k = 0; k <= n / 2; ++k) bins.push_back(k);
+            } else {
+                bins = {0, 1, 7, 8, n / 8 - 1, n / 4, n / 2 - 1, n / 2};
+            }
+            for (int k : bins) {
+                std::complex<double> value{};
+                double windowSum = 0;
+                for (int i = 0; i < n; ++i) {
+                    const double hann = 0.5 - 0.5 * std::cos(2 * pi * i / n);
+                    value += double(samples[i]) * hann * std::polar(1.0, -2 * pi * k * i / n);
+                    windowSum += hann;
+                }
+                double power = std::norm(value) / (windowSum * windowSum);
+                if (k != 0 && k != n / 2) power *= 4;
+                expected[k] = 10 * std::log10(std::max(1e-12, power));
+            }
+            for (int oldest : {0, 1, n - 3}) {
+                for (int i = 0; i < n; ++i) circular[(oldest + i) % n] = samples[i];
+                fft.analyze(circular.data(), std::size_t(oldest), db);
+                QCOMPARE(db.size(), std::size_t(n / 2 + 1));
+                for (int k : bins)
+                    QVERIFY2(std::abs(db[k] - expected[k]) < 0.01,
+                             qPrintable(QString("N=%1, bin=%2, oldest=%3: FFT=%4, DFT=%5")
+                                        .arg(n).arg(k).arg(oldest).arg(db[k]).arg(expected[k])));
+            }
+            // Reusing a plan must completely replace the previous frame.
+            std::fill(samples.begin(), samples.end(), 0);
+            fft.analyze(samples.data(), 0, db);
+            for (float value : db) QCOMPARE(value, -120.0f);
+            std::fill(samples.begin(), samples.end(), 0.25f);
+            fft.analyze(samples.data(), 0, db);
+            QVERIFY(std::abs(db[0] - 20 * std::log10(0.25)) < 1e-4);
+            for (int i = 0; i < n; ++i) samples[i] = i % 2 ? -0.25f : 0.25f;
+            fft.analyze(samples.data(), 0, db);
+            QVERIFY(std::abs(db[n / 2] - 20 * std::log10(0.25)) < 1e-4);
+            for (int i = 0; i < n; ++i) samples[i] = float(0.25 * std::cos(2 * pi * (n / 8) * i / n));
+            fft.analyze(samples.data(), 0, db);
+            QVERIFY(std::abs(db[n / 8] - 20 * std::log10(0.25)) < 1e-4);
+        }
     }
     void touchPinchTransitionAndCancel() {
         EqWidget widget; widget.resize(800,480); widget.setBands({Band{}}); widget.show(); QTest::qWait(60);

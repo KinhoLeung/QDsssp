@@ -118,6 +118,7 @@ private:
     qreal gainY(double db) const;
     QPainterPath makeResponsePath(const std::vector<double> &db) const;
     QRect responseBounds(const QPainterPath &path) const;
+    QRect spectrumBounds(const QPainterPath &path) const;
 
     ResponseCache response_;
     std::shared_ptr<SpectrumMailbox> mailbox_;

@@ -1,4 +1,5 @@
 #include "qdsssp/audio_spectrum.h"
+#include "spectrum_fft.h"
 
 #include <QFile>
 #include <QString>
@@ -8,7 +9,6 @@
 #include <cassert>
 #include <chrono>
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <mutex>
 #include <thread>
@@ -23,8 +23,6 @@
 namespace qdsssp {
 
 namespace {
-constexpr float kPi = 3.14159265358979323846f;
-
 bool validConfig(const PipeWireSpectrumSource::Config &config) {
     return config.sampleRate >= 100 && config.sampleRate <= 768000 &&
            config.channels >= 1 && config.channels <= 32 &&
@@ -132,14 +130,9 @@ public:
         return true;
     }
 
-    void applyHann(const std::vector<float> &hann, std::vector<std::complex<float>> &values) const {
-        // position_ points to the oldest sample once the history is full.
-        const auto first = history_.size() - position_;
-        for (std::size_t i = 0; i < first; ++i)
-            values[i] = std::complex<float>(history_[position_ + i] * hann[i], 0.0f);
-        for (std::size_t i = first; i < history_.size(); ++i)
-            values[i] = std::complex<float>(history_[i - first] * hann[i], 0.0f);
-    }
+    const float *data() const { return history_.data(); }
+    // position_ points to the oldest sample once the history is full.
+    std::size_t oldest() const { return position_; }
 
 private:
     void append(std::size_t count) {
@@ -160,30 +153,6 @@ private:
     std::chrono::steady_clock::time_point lastInput_{};
 };
 
-void fft(std::vector<std::complex<float>> &values) {
-    const std::size_t n = values.size();
-    for (std::size_t i = 1, j = 0; i < n; ++i) {
-        std::size_t bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap(values[i], values[j]);
-    }
-    for (std::size_t length = 2; length <= n; length <<= 1) {
-        const float angle = -2.0f * kPi / float(length);
-        const std::complex<float> step(std::cos(angle), std::sin(angle));
-        for (std::size_t first = 0; first < n; first += length) {
-            std::complex<float> factor(1.0f, 0.0f);
-            const std::size_t half = length >> 1;
-            for (std::size_t i = 0; i < half; ++i) {
-                const auto even = values[first + i];
-                const auto odd = factor * values[first + i + half];
-                values[first + i] = even + odd;
-                values[first + i + half] = even - odd;
-                factor *= step;
-            }
-        }
-    }
-}
 } // namespace
 
 struct PipeWireSpectrumSource::Impl {
@@ -214,15 +183,8 @@ struct PipeWireSpectrumSource::Impl {
         const int n = config.fftSize;
         const int hop = config.hopSize;
         AnalysisWindow window(n, hop);
-        std::vector<float> hann(std::size_t(n), 0.0f);
-        std::vector<std::complex<float>> values;
-        values.resize(std::size_t(n));
+        detail::SpectrumFft fft(n);
         std::vector<float> db(std::size_t(n / 2 + 1));
-        float windowSum = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            hann[std::size_t(i)] = 0.5f - 0.5f * std::cos(2.0f * kPi * i / n);
-            windowSum += hann[std::size_t(i)];
-        }
 
         while (!stopRequested.load(std::memory_order_acquire)) {
             const auto state = output->analysisState();
@@ -231,17 +193,7 @@ struct PipeWireSpectrumSource::Impl {
                 continue;
             }
 
-            window.applyHann(hann, values);
-            fft(values);
-            const float scale = 1.0f / std::max(1.0f, windowSum);
-            for (int k = 0; k <= n / 2; ++k) {
-                // 20*log10(amplitude) == 10*log10(power). Keeping the
-                // calculation in the power domain avoids one sqrt per bin
-                // on the ARM worker while preserving the -120 dB floor.
-                float power = std::norm(values[std::size_t(k)]) * scale * scale;
-                if (k != 0 && k != n / 2) power *= 4.0f;
-                db[std::size_t(k)] = 10.0f * std::log10(std::max(power, 1.0e-12f));
-            }
+            fft.analyze(window.data(), window.oldest(), db);
             output->publish(db.data(), int(db.size()), actualRate.load(std::memory_order_relaxed), state);
         }
     }
@@ -503,15 +455,8 @@ struct PcmFileSpectrumSource::Impl {
         const int n = config.fftSize;
         const int hop = config.hopSize;
         AnalysisWindow window(n, hop);
-        std::vector<float> hann(std::size_t(n), 0.0f);
-        std::vector<std::complex<float>> values;
-        values.resize(std::size_t(n));
+        detail::SpectrumFft fft(n);
         std::vector<float> db(std::size_t(n / 2 + 1));
-        float windowSum = 0.0f;
-        for (int i = 0; i < n; ++i) {
-            hann[std::size_t(i)] = 0.5f - 0.5f * std::cos(2.0f * kPi * i / n);
-            windowSum += hann[std::size_t(i)];
-        }
 
         while (!stopRequested.load(std::memory_order_acquire)) {
             const auto state = output->analysisState();
@@ -521,14 +466,7 @@ struct PcmFileSpectrumSource::Impl {
             }
 
             const auto fftStart = std::chrono::steady_clock::now();
-            window.applyHann(hann, values);
-            fft(values);
-            const float scale = 1.0f / std::max(1.0f, windowSum);
-            for (int k = 0; k <= n / 2; ++k) {
-                float power = std::norm(values[std::size_t(k)]) * scale * scale;
-                if (k != 0 && k != n / 2) power *= 4.0f;
-                db[std::size_t(k)] = 10.0f * std::log10(std::max(power, 1.0e-12f));
-            }
+            fft.analyze(window.data(), window.oldest(), db);
             const auto fftNs = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - fftStart).count());
             fftNanoseconds.fetch_add(fftNs, std::memory_order_relaxed);

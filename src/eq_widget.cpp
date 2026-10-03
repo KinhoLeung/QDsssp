@@ -229,7 +229,7 @@ void EqWidget::frameTick() {
         rebuildOverlay();
     if (footerDirty_) rebuildFooter();
     QElapsedTimer spectrumTiming; if (profiling_) spectrumTiming.start();
-    bool spectrumChanged=false;
+    QRect spectrumDamage;
     if (spectrumEnabled_ && analysis.enabled) {
         const bool fresh=mailbox_->takeLatest(spectrumFrame_);
         if (fresh) lastSpectrumMs_=now;
@@ -245,10 +245,16 @@ void EqWidget::frameTick() {
             const float value=std::max(target,spectrumDisplay_[i]-release);
             changed=changed || value!=spectrumDisplay_[i]; spectrumDisplay_[i]=value;
         }
-        if (changed) { rebuildSpectrum(); spectrumChanged=true; }
+        if (changed) {
+            // Restore old pixels as well as drawing the new trace. Filling
+            // extends down to the dBFS floor, unlike the stroke alone.
+            spectrumDamage=spectrumBounds(spectrumPath_);
+            rebuildSpectrum();
+            spectrumDamage=spectrumDamage.united(spectrumBounds(spectrumPath_));
+        }
     }
     if (profiling_) profile_->phases[FrameProfile::Spectrum].add(spectrumTiming.nsecsElapsed());
-    if (spectrumChanged) pendingUpdate_+=plotRect().adjusted(-2,-2,2,2).toAlignedRect();
+    pendingUpdate_+=spectrumDamage;
     // Keep graph and footer damage separate instead of repainting the axes
     // and the space between them on every parameter edit.
     const QRegion repaintRegion=pendingUpdate_.intersected(QRegion(rect()));
@@ -311,6 +317,16 @@ QPainterPath EqWidget::makeResponsePath(const std::vector<double> &db) const {
 QRect EqWidget::responseBounds(const QPainterPath &path) const {
     detail::OverlayCoverage coverage(rect());
     coverage.addPath(path,plotRect().adjusted(-1,-1,1,1),2+2/devicePixelRatioF());
+    return coverage.rect();
+}
+QRect EqWidget::spectrumBounds(const QPainterPath &path) const {
+    if (path.isEmpty()) return {};
+    auto bounds=path.controlPointRect();
+    if (fillSpectrum_) bounds.setBottom(std::max(bounds.bottom(),plotRect().bottom()));
+    detail::OverlayCoverage coverage(rect());
+    const qreal margin=2+2/devicePixelRatioF();
+    coverage.add(bounds.adjusted(-margin,-margin,margin,margin)
+                 .intersected(plotRect().adjusted(-1,-1,1,1)));
     return coverage.rect();
 }
 void EqWidget::rebuildResponse() {
