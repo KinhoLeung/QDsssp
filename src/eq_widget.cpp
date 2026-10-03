@@ -2,9 +2,11 @@
 #include "qdsssp/filter_icon.h"
 #include "response_path.h"
 #include "overlay_region.h"
+#include "footer_text.h"
 #include <QHideEvent>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QPaintEvent>
 #include <QPainter>
 #include <QTouchEvent>
 #include <QWheelEvent>
@@ -176,12 +178,15 @@ void EqWidget::requestFrame() {
     frameTimer_.start(remaining);
 }
 void EqWidget::invalidateBand(int index, const Band &previous, const Band &next) {
-    responseDirty_=true; sumPathDirty_=true;
-    if (index==selected_) { bandPathDirty_=true; footerDirty_=true; }
+    responseDirty_=true;
+    if (index==selected_) footerDirty_=true;
+    if (index==selected_ && previous.useCustomCoefficients!=next.useCustomCoefficients) overlayDirty_=true;
     const double oldGain=hasGain(previous.type)?previous.gainDb:0;
     const double newGain=hasGain(next.type)?next.gainDb:0;
-    if (previous.frequency!=next.frequency || oldGain!=newGain || previous.enabled!=next.enabled)
+    if (previous.frequency!=next.frequency || oldGain!=newGain || previous.enabled!=next.enabled) {
         markerDirty_[index]=true;
+        overlayDirty_=true;
+    }
 }
 void EqWidget::invalidateSelection(int previous, int next) {
     if (previous>=0) markerDirty_[previous]=true;
@@ -332,7 +337,9 @@ QRect EqWidget::spectrumBounds(const QPainterPath &path) const {
 void EqWidget::rebuildResponse() {
     QElapsedTimer timing; if (profiling_) timing.start();
     if (responseDirty_) {
-        response_.update();
+        const auto selectedRevision=selected_>=0?response_.bandRevision(selected_):0;
+        sumPathDirty_=response_.update() || sumPathDirty_;
+        if (selected_>=0 && selectedRevision!=response_.bandRevision(selected_)) bandPathDirty_=true;
         if (profiling_) profile_->phases[FrameProfile::Response].add(timing.nsecsElapsed());
     }
     if (profiling_) timing.restart();
@@ -354,7 +361,7 @@ void EqWidget::rebuildResponse() {
     if (profiling_ && pathsChanged) profile_->phases[FrameProfile::Paths].add(timing.nsecsElapsed());
     responseDirty_=false;
     sumPathDirty_=false; bandPathDirty_=false;
-    overlayDirty_=true;
+    overlayDirty_=overlayDirty_ || pathsChanged;
 }
 void EqWidget::prepareOverlay() {
     QElapsedTimer timing; if (profiling_) timing.start();
@@ -447,7 +454,7 @@ void EqWidget::rebuildSpectrum() {
     }
 }
 
-void EqWidget::paintEvent(QPaintEvent *) {
+void EqWidget::paintEvent(QPaintEvent *event) {
     QElapsedTimer timing; timing.start();
     if (profiling_) {
         const auto now = clock_.nsecsElapsed();
@@ -484,7 +491,7 @@ void EqWidget::paintEvent(QPaintEvent *) {
         p.save(); p.setClipRect(overlayInk_,Qt::IntersectClip);
         p.drawImage(overlayRect_.topLeft(),overlay_); p.restore();
     }
-    else paintOverlay(p);
+    else paintOverlay(p,&event->region());
     p.end();
     ++paintedFrames_;
     const auto ns=timing.nsecsElapsed(); totalPaintNs_+=ns; maxPaintNs_=std::max(maxPaintNs_,ns);
@@ -508,7 +515,7 @@ const QImage &EqWidget::markerImage(int i) {
     return image;
 }
 
-void EqWidget::paintOverlay(QPainter &p) {
+void EqWidget::paintOverlay(QPainter &p,const QRegion *damage) {
     QElapsedTimer timing; if (profiling_) timing.start();
     p.save(); p.setClipRect(overlayRect_,Qt::IntersectClip);
     p.save(); p.setClipRect(overlayClip_,Qt::IntersectClip);
@@ -521,6 +528,8 @@ void EqWidget::paintOverlay(QPainter &p) {
     p.setRenderHint(QPainter::Antialiasing,true);
     for (int i=0;i<overlayMarkerCount_;++i) {
         const auto &marker=overlayMarkers_[i];
+        if (damage && !damage->intersects(QRectF(marker.position-QPointF(18,18),QSizeF(36,36))
+                                          .toAlignedRect().adjusted(-1,-1,1,1))) continue;
         p.drawImage(marker.position-QPointF(18,18),marker.image);
     }
     if (overlayExternalCoefficients_) {
@@ -538,44 +547,59 @@ void EqWidget::rebuildFooter() {
     // repeatedly clearing and alpha-blending a full-widget overlay.
     QPainter p(&background_); p.setRenderHint(QPainter::Antialiasing,true);
     p.setClipRect(QRect(0,height()-76,width(),76));
-    QFont f=font();
-    f.setBold(false); f.setPixelSize(13); p.setFont(f); p.setPen(ink);
+    if (!footerValid_) {
+        // Reuse the adjusted font and its resolved engine throughout edits.
+        footerFont_=font(); footerFont_.setBold(false); footerFont_.setPixelSize(13);
+    }
+    p.setFont(footerFont_); p.setPen(ink);
     const bool reset=!footerValid_ || footerSelection_!=selected_;
-    if (reset) p.fillRect(QRect(0,height()-76,width(),76),background);
+    QRegion damage;
+    if (reset) {
+        const QRect area(0,height()-76,width(),76);
+        p.fillRect(area,background); damage+=area;
+    }
     if (selected_>=0) {
         const auto &b=bands()[selected_];
         const QString info=QString("%1   %2     %3     %4 dB     Q %5")
             .arg(selected_+1,2,10,QLatin1Char('0')).arg(filterName(b.type))
             .arg(frequencyLabel(b.frequency)).arg(b.gainDb,0,'f',1).arg(b.q,0,'f',2);
         if (reset || info!=footerText_) {
-            p.fillRect(QRect(48,height()-76,width()-48,24),background);
-            p.drawText(QRectF(48,height()-75,width()-96,22),Qt::AlignVCenter,
-                       fontMetrics().elidedText(info,Qt::ElideRight,width()-96));
+            const QRect area(48,height()-76,width()-48,24);
+            p.fillRect(area,background); damage+=area;
+            detail::drawFooterText(p,QRectF(48,height()-75,width()-96,22),info,font());
         }
         footerText_=info;
         const int sign=(b.gainDb>0)-(b.gainDb<0);
         if (reset || footerType_!=int(b.type) || footerSign_!=sign) {
-            p.fillRect(QRect(0,height()-76,48,24),background);
+            const QRect area(0,height()-76,48,24);
+            p.fillRect(area,background); damage+=area;
             paintFilterIcon(p,QRectF(15,height()-72,24,18),b.type,b.gainDb,bandColor(selected_));
         }
         footerType_=int(b.type); footerSign_=sign;
         const auto qr=qControlRect(); const qreal y=qr.center().y();
         const bool editable=canEdit() && hasQ(b.type);
         if (reset || footerQ_!=b.q || footerEditable_!=editable) {
-            p.fillRect(QRect(0,height()-52,width(),52),background);
+            const qreal x=qr.left()+std::log(b.q/0.1)/std::log(300.0)*qr.width();
+            QRect area(0,height()-52,width(),52);
+            if (!reset && footerEditable_==editable) {
+                const qreal oldX=qr.left()+std::log(footerQ_/0.1)/std::log(300.0)*qr.width();
+                area=QRectF(std::min(x,oldX)-12,y-12,std::abs(x-oldX)+24,24).toAlignedRect();
+            }
+            damage+=area;
+            p.save(); p.setClipRect(area,Qt::IntersectClip); p.fillRect(area,background);
             p.setPen(editable?ink:muted); p.drawText(QRectF(12,y-12,28,24),Qt::AlignCenter,"Q");
             p.setPen(QPen(grid,4,Qt::SolidLine,Qt::RoundCap)); p.drawLine(QPointF(qr.left(),y),QPointF(qr.right(),y));
-            const qreal x=qr.left()+std::log(b.q/0.1)/std::log(300.0)*qr.width();
             p.setPen(QPen(editable?bandColor(selected_):muted,4,Qt::SolidLine,Qt::RoundCap));
             p.drawLine(QPointF(qr.left(),y),QPointF(x,y)); p.setBrush(editable?bandColor(selected_):muted);
             p.setPen(Qt::NoPen); p.drawEllipse(QPointF(x,y),9,9);
+            p.restore();
         }
         footerQ_=b.q; footerEditable_=editable;
     } else if (reset) {
         p.setPen(muted); p.drawText(QRectF(30,height()-74,width()-60,56),Qt::AlignCenter,tr("Select an EQ point to edit frequency, gain and Q"));
     }
     p.end(); footerSelection_=selected_; footerValid_=true; footerDirty_=false;
-    pendingUpdate_+=QRect(0,height()-76,width(),76);
+    pendingUpdate_+=damage;
     if (profiling_) profile_->phases[FrameProfile::Footer].add(timing.nsecsElapsed());
 }
 

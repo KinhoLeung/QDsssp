@@ -130,6 +130,7 @@ void ResponseCache::setGrid(int count, double lo, double hi, double fs) {
         cos2_[i] = std::cos(2*w); sin2_[i] = std::sin(2*w);
     }
     for (auto &band : bands_) band = sanitized(band, fs);
+    valid_.fill(false);
     dirty_.fill(true); sumDirty_ = true; rebuildSum_ = true;
 }
 void ResponseCache::setBands(const std::vector<Band> &bands) {
@@ -155,6 +156,7 @@ bool ResponseCache::update() {
     if (!sumDirty_) return false;
     // Rebase periodically to prevent roundoff accumulating during long edits.
     const bool rebuild = rebuildSum_ || incrementalUpdates_ >= 256;
+    bool changed = rebuild;
     for (int band = 0; band < int(bands_.size()); ++band) {
         if (!dirty_[band]) continue;
         const auto &b = bands_[band];
@@ -164,10 +166,19 @@ bool ResponseCache::update() {
         const bool bypass = !b.enabled || b.type == FilterType::Bypass;
         const bool constant = bypass || (!b.useCustomCoefficients &&
             (b.type == FilterType::Gain || (hasGain(b.type) && b.gainDb == 0.0)));
+        const double value = bypass ? 0.0 : b.gainDb;
+        const auto c = constant ? Biquad{} : designBiquad(b, sampleRate_);
+        // Model parameters can change while the effective response stays the
+        // same (bypass, unity Peak/shelf, Gain frequency/Q, or custom metadata).
+        if (valid_[band] && constant_[band] == constant &&
+            (constant ? constantDb_[band] == value : coefficients_[band] == c)) {
+            dirty_[band] = false;
+            continue;
+        }
+        changed = true;
         if (constant) {
             // Bands are sanitized on entry. Gain is constant in dB; exactly
             // zero-gain Peak/shelf filters and bypass have unity response.
-            const double value = bypass ? 0.0 : b.gainDb;
             if (rebuild) {
                 std::fill(curve.begin(), curve.end(), value);
             } else {
@@ -177,24 +188,25 @@ bool ResponseCache::update() {
                 }
             }
         } else {
-            const auto c = designBiquad(b, sampleRate_);
             for (int i = 0; i < int(sum_.size()); ++i) {
                 const double value = response(c, cos1_[i], sin1_[i], cos2_[i], sin2_[i]);
                 if (!rebuild) sum_[i] += value - curve[i];
                 curve[i] = value;
             }
         }
-        dirty_[band] = false; ++evaluations_;
+        valid_[band] = true; constant_[band] = constant;
+        constantDb_[band] = value; coefficients_[band] = c;
+        dirty_[band] = false; ++evaluations_; ++revisions_[band];
     }
     if (rebuild) {
         std::fill(sum_.begin(), sum_.end(), 0);
         for (int band = 0; band < int(bands_.size()); ++band)
             for (int i = 0; i < int(sum_.size()); ++i) sum_[i] += curves_[band][i];
         incrementalUpdates_ = 0;
-    } else ++incrementalUpdates_;
+    } else if (changed) ++incrementalUpdates_;
     rebuildSum_ = false;
     sumDirty_ = false;
-    return true;
+    return changed;
 }
 
 } // namespace qdsssp

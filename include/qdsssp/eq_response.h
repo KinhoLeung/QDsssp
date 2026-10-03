@@ -56,16 +56,21 @@ public:
     void setGrid(int points, double minHz, double maxHz, double sampleRate);
     void setBands(const std::vector<Band> &bands);
     void setBand(int index, const Band &band);
-    bool update();
+    bool update(); // false when pending edits preserve the effective response
     const std::vector<double> &frequencies() const { return frequencies_; }
     const std::vector<double> &sumDb() const { return sum_; }
     const std::vector<double> &bandDb(int index) const { return curves_.at(index); }
     const std::vector<Band> &bands() const { return bands_; }
     unsigned long evaluationCount() const { return evaluations_; }
+    unsigned long bandRevision(int index) const { return revisions_.at(index); }
 private:
     std::vector<Band> bands_;
     std::array<std::vector<double>, MaxBands> curves_;
     std::array<bool, MaxBands> dirty_{};
+    std::array<bool, MaxBands> valid_{}, constant_{};
+    std::array<double, MaxBands> constantDb_{};
+    std::array<Biquad, MaxBands> coefficients_;
+    std::array<unsigned long, MaxBands> revisions_{};
     std::vector<double> frequencies_, cos1_, sin1_, cos2_, sin2_, sum_;
     double sampleRate_ = 48000, minHz_ = 20, maxHz_ = 20000;
     bool sumDirty_ = true;

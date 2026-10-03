@@ -98,7 +98,7 @@ private:
     void rebuildResponse();
     void prepareOverlay();
     void rebuildOverlay();
-    void paintOverlay(QPainter &painter);
+    void paintOverlay(QPainter &painter, const QRegion *damage = nullptr);
     void rebuildFooter();
     const QImage &markerImage(int index);
     void rebuildSpectrum();
@@ -130,7 +130,7 @@ private:
     QRect overlayRect_;
     QRect overlayInk_;
     QRectF overlayClip_;
-    QFont overlayFont_;
+    QFont overlayFont_, footerFont_;
     QColor overlayBandFillColor_;
     struct OverlayMarker { QPointF position; QImage image; };
     std::array<OverlayMarker, ResponseCache::MaxBands> overlayMarkers_;

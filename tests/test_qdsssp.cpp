@@ -3,6 +3,7 @@
 #include "qdsssp/filter_icon.h"
 #include "../src/response_path.h"
 #include "../src/overlay_region.h"
+#include "../src/footer_text.h"
 #include "../src/spectrum_fft.h"
 #include <QPainter>
 #include <QPaintEvent>
@@ -116,8 +117,8 @@ private slots:
         QCOMPARE(cache.evaluationCount(),33UL);
 
         bands[17].q=3;
-        cache.setBands(bands); QVERIFY(cache.update());
-        QCOMPARE(cache.evaluationCount(),34UL);
+        cache.setBands(bands); QVERIFY(!cache.update()); // zero-gain Peak is unity
+        QCOMPARE(cache.evaluationCount(),33UL);
 
         // The widget applies the same no-op guard before scheduling a frame.
         EqWidget widget; widget.resize(800,480); widget.setSpectrumEnabled(false);
@@ -157,6 +158,97 @@ private slots:
         cache.setGrid(301,30,16000,48000); cache.update(); verify();
         bands.resize(3); cache.setBands(bands); cache.update(); verify();
         cache.setBands({}); cache.update(); verify();
+    }
+    void unchangedEffectiveResponsePreservesCaches() {
+        ResponseCache cache;
+        std::vector<Band> bands(4);
+        bands[0].type=FilterType::Bypass;
+        bands[1].type=FilterType::Gain; bands[1].gainDb=6;
+        bands[2].gainDb=0;
+        bands[3].useCustomCoefficients=true;
+        bands[3].coefficients={2,0,0,0,0};
+        cache.setBands(bands); QVERIFY(cache.update());
+        const auto sum=cache.sumDb();
+        const auto evaluations=cache.evaluationCount();
+        for (int step=0;step<300;++step) {
+            for (int band=0;band<4;++band) {
+                bands[band].frequency=30+step*20;
+                bands[band].q=0.1+step*0.09;
+                if (band==0 || band==3) bands[band].gainDb=step%48-24;
+            }
+            cache.setBands(bands); QVERIFY(!cache.update());
+            QCOMPARE(cache.sumDb(),sum);
+        }
+        QCOMPARE(cache.evaluationCount(),evaluations);
+        cache.setGrid(301,20,20000,48000); QVERIFY(cache.update());
+        QCOMPARE(cache.evaluationCount(),evaluations+4);
+        for (double value:cache.sumDb()) QVERIFY(std::abs(value-12.02059991328)<1e-8);
+
+        EqWidget widget; widget.resize(800,480); widget.setSpectrumEnabled(false);
+        Band unity; widget.setBands({unity}); widget.setSelectedBand(0);
+        widget.show(); QTest::qWait(180); widget.startProfiling();
+        unity.q=3; widget.setBand(0,unity); QTest::qWait(60);
+        QCOMPARE(widget.profile()->phases[FrameProfile::Paths].count,quint64(0));
+        QCOMPARE(widget.profile()->phases[FrameProfile::Overlay].count,quint64(0));
+        unity.useCustomCoefficients=true; widget.setBand(0,unity); QTest::qWait(180);
+        EqWidget fresh; fresh.resize(widget.size()); fresh.setSpectrumEnabled(false);
+        fresh.setBands({unity}); fresh.setSelectedBand(0); fresh.show(); QTest::qWait(180);
+        QCOMPARE(widget.grab().toImage(),fresh.grab().toImage());
+    }
+    void footerTextMatchesPainter() {
+        for (double dpr:{1.0,1.5,2.0}) for (bool italic:{false,true})
+        for (int type=0;type<=12;++type) for (int width:{220,704}) {
+            QFont font; font.setPixelSize(13); font.setItalic(italic);
+            const QString text=QString("03   %1     1.23 kHz     -12.3 dB     Q 30.00").arg(filterName(FilterType(type)));
+            QImage reference(QSize(qCeil(800*dpr),qCeil(80*dpr)),QImage::Format_RGB32);
+            reference.setDevicePixelRatio(dpr); reference.fill(QColor(17,24,32));
+            QImage prepared=reference;
+            const QRectF area(48,14,width,22);
+            { QPainter p(&reference); p.setFont(font); p.setPen(Qt::white);
+              p.drawText(area,Qt::AlignVCenter,QFontMetrics(font).elidedText(text,Qt::ElideRight,width)); }
+            { QPainter p(&prepared); p.setFont(font); p.setPen(Qt::white);
+              detail::drawFooterText(p,area,text,font); }
+            QCOMPARE(prepared,reference);
+        }
+    }
+    void eqAndFooterDamageCoversEveryChangedPixel() {
+        DamageTrackingWidget widget; widget.resize(800,480); widget.setSpectrumEnabled(false);
+        std::vector<Band> bands(4);
+        for (int i=0;i<4;++i) { bands[i].frequency=80*std::pow(5,i); bands[i].gainDb=4*i-6; }
+        widget.setBands(bands); widget.setSelectedBand(1); widget.show(); QTest::qWait(180);
+        auto previous=widget.grab().toImage(); widget.damage=QRegion();
+        for (int step=0;step<16;++step) {
+            if (step==0) bands[1].frequency=2500;
+            if (step==1) { bands[1].gainDb=24; bands[1].q=30; }
+            if (step==2) { bands[1].gainDb=-24; bands[1].q=0.1; }
+            if (step==3) bands[1].type=FilterType::HighPass2;
+            if (step==4) bands[1].type=FilterType::LowShelf2;
+            if (step<5) widget.setBand(1,bands[1]);
+            if (step==5) widget.setSelectedBand(3);
+            if (step==6) widget.setSelectedBandFillEnabled(false);
+            if (step==7) widget.setSelectedBandFillEnabled(true);
+            if (step==8) widget.setSelectedBandFillOpacity(0);
+            if (step==9) widget.setSelectedBandFillOpacity(0.75);
+            if (step==10) widget.setCurveAntialiasing(false);
+            if (step==11) widget.setCurveAntialiasing(true);
+            if (step==12) { bands[0].enabled=false; widget.setBand(0,bands[0]); }
+            if (step==13) widget.setSelectedBand(-1);
+            if (step==14) { bands.resize(2); widget.setBands(bands); widget.setSelectedBand(1); }
+            if (step==15) { bands[1].useCustomCoefficients=true; widget.setBand(1,bands[1]); }
+            QTest::qWait(70);
+            const auto damage=widget.damage;
+            const auto next=widget.grab().toImage();
+            int changed=0; const double dpr=next.devicePixelRatioF();
+            for (int y=0;y<next.height();++y) for (int x=0;x<next.width();++x) {
+                if (previous.pixel(x,y)==next.pixel(x,y)) continue;
+                ++changed;
+                QVERIFY2(damage.contains(QPoint(int(x/dpr),int(y/dpr))),
+                         qPrintable(QString("EQ/footer damage missed a pixel at step %1").arg(step)));
+            }
+            QVERIFY(changed>0);
+            if (step==0) QVERIFY(!damage.intersects(QRect(0,widget.height()-52,widget.width(),52)));
+            previous=next; widget.damage=QRegion();
+        }
     }
     void responsePolylineErrorBound() {
         const QRectF rect(48,26,696,290);

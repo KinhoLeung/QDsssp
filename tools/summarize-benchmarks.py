@@ -44,7 +44,9 @@ def main():
     for scenario in sorted({row['scenario'] for row in rows}):
         for repeat in {row['repeat'] for row in rows if row['scenario'] == scenario}:
             pair = [row for row in rows if row['scenario'] == scenario and row['repeat'] == repeat]
-            if len(pair) != 2 or pair[0]['metadata'] != pair[1]['metadata']:
+            if (len(pair) != 2 or {row['version'] for row in pair} != {'baseline', 'optimized'} or
+                    pair[0]['metadata'] != pair[1]['metadata'] or
+                    any(pair[0][key] != pair[1][key] for key in ('warmup_updates', 'measured_updates'))):
                 raise ValueError(f'Unmatched benchmark parameters: {scenario}, repeat {repeat}')
         for version in ('baseline', 'optimized'):
             group = [row for row in rows if row['scenario'] == scenario and row['version'] == version]

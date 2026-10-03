@@ -38,7 +38,8 @@ int main(int argc,char **argv) {
     QCoreApplication::setApplicationName("qdsssp_demo");
     QCommandLineParser parser; parser.addHelpOption();
     parser.addOption({"screenshot","Save an 800x480 PNG and exit.","path"});
-    parser.addOption({"benchmark","Run 32 bands, 8193 spectrum bins and continuous editing; report warmed-up wall-clock timings. User input is blocked during this test.","updates","0"});
+    parser.addOption({"benchmark","Run continuous editing with 8193 spectrum bins (32 bands by default); report warmed-up wall-clock timings. User input is blocked during this test.","updates","0"});
+    parser.addOption({"benchmark-bands","Number of EQ bands in the benchmark (1..32).","bands","32"});
     parser.addOption({"warmup","Input updates excluded from benchmark statistics.","updates","60"});
     parser.addOption({"fps","Display frame rate (10..60).","fps","30"});
     parser.addOption({"no-aa","Disable antialiasing on response curves."});
@@ -93,15 +94,20 @@ int main(int argc,char **argv) {
     }
     BenchmarkInputBlocker inputBlocker;
     if (benchmarkFrames>0) app.installEventFilter(&inputBlocker);
-    const int count=benchmarkFrames>0?32:6;
+    const int count=benchmarking?parser.value("benchmark-bands").toInt():6;
+    if (count<1 || count>ResponseCache::MaxBands) {
+        QTextStream(stderr) << "Use 1..32 benchmark bands.\n";
+        return 2;
+    }
+    const int editedBand=std::min(2,count-1);
     std::vector<Band> bands(count);
     for (int i=0;i<count;++i) {
-        bands[i].frequency=50*std::pow(240.0,double(i)/(count-1));
+        bands[i].frequency=50*std::pow(240.0,double(i)/std::max(1,count-1));
         bands[i].gainDb=std::sin(i*1.7)*5; bands[i].q=1.2+0.3*i;
         bandSelect->addItem(QString("EQ %1").arg(i+1));
     }
     if (count==6) { bands[0].type=FilterType::LowShelf2; bands[0].gainDb=4; bands[5].type=FilterType::HighShelf2; bands[5].gainDb=2; }
-    eq->setBands(bands); eq->setSelectedBand(2);
+    eq->setBands(bands); eq->setSelectedBand(editedBand);
     auto syncControls=[&] {
         const int i=eq->selectedBand();
         QSignalBlocker a(bandSelect),b(typeSelect),c(enabled);
@@ -218,17 +224,17 @@ int main(int argc,char **argv) {
         if (benchmarkFrames>0) {
             if (!parser.isSet("static-eq")) {
                 if (parser.isSet("benchmark-same-band")) {
-                    eq->setBand(2,eq->bands()[2]);
+                    eq->setBand(editedBand,eq->bands()[editedBand]);
                 } else if (parser.isSet("benchmark-same-bands")) {
                     eq->setBands(bands);
                 } else if (parser.isSet("benchmark-snapshot-one-change")) {
-                    bands[2].frequency=800+500*std::sin(frame*0.04);
-                    bands[2].gainDb=12*std::sin(frame*0.07);
-                    bands[2].q=0.5+8*(0.5+0.5*std::sin(frame*0.02));
+                    bands[editedBand].frequency=800+500*std::sin(frame*0.04);
+                    bands[editedBand].gainDb=12*std::sin(frame*0.07);
+                    bands[editedBand].q=0.5+8*(0.5+0.5*std::sin(frame*0.02));
                     eq->setBands(bands);
                 } else {
-                    auto b=eq->bands()[2]; b.frequency=800+500*std::sin(frame*0.04);
-                    b.gainDb=12*std::sin(frame*0.07); b.q=0.5+8*(0.5+0.5*std::sin(frame*0.02)); eq->setBand(2,b);
+                    auto b=eq->bands()[editedBand]; b.frequency=800+500*std::sin(frame*0.04);
+                    b.gainDb=12*std::sin(frame*0.07); b.q=0.5+8*(0.5+0.5*std::sin(frame*0.02)); eq->setBand(editedBand,b);
                 }
             }
             if (frame>warmup) sourceTiming.add(sourceClock.nsecsElapsed());
