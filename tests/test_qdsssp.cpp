@@ -4,6 +4,7 @@
 #include "../src/response_path.h"
 #include "../src/overlay_region.h"
 #include "../src/footer_text.h"
+#include "../src/marker_sprite.h"
 #include "../src/spectrum_fft.h"
 #include <QPainter>
 #include <QPaintEvent>
@@ -211,6 +212,60 @@ private slots:
             QCOMPARE(prepared,reference);
         }
     }
+    void cachedFooterDigitsMatchPainter() {
+        int cachedDraws=0;
+        for (double dpr:{1.0,1.5,2.0}) for (const auto *family:{"DejaVu Sans","DejaVu Serif"})
+        for (bool italic:{false,true}) for (bool kerning:{false,true}) {
+            detail::FooterTextCache cache;
+            QFont font(family); font.setPixelSize(13); font.setItalic(italic); font.setKerning(kerning);
+            for (int step=0;step<40;++step) {
+                const int width=step%11==0?220:704;
+                const QString frequency=step%3==0?QString("%1 Hz").arg(990+step):
+                    QString("%1 kHz").arg(1.0+step*0.17,0,'f',2);
+                const QString text=QString("%1   %2     %3     %4 dB     Q %5")
+                    .arg(step%32+1,2,10,QLatin1Char('0')).arg(filterName(FilterType(step%13)))
+                    .arg(frequency).arg((step-20)*1.1,0,'f',1).arg(0.1+step*0.7,0,'f',2);
+                QImage reference(QSize(qCeil(800*dpr),qCeil(80*dpr)),QImage::Format_RGB32);
+                reference.setDevicePixelRatio(dpr); reference.fill(QColor(17,24,32));
+                QImage prepared=reference;
+                const QRectF area(48,14,width,22);
+                { QPainter p(&reference); p.setFont(font); p.setPen(Qt::white);
+                  p.drawText(area,Qt::AlignVCenter,QFontMetrics(font).elidedText(text,Qt::ElideRight,width)); }
+                { QPainter p(&prepared); p.setFont(font); p.setPen(Qt::white);
+                  if (cache.draw(p,area,text)) ++cachedDraws;
+                  else detail::drawFooterText(p,area,text,font); }
+                QCOMPARE(prepared,reference);
+            }
+        }
+        QVERIFY(cachedDraws>0);
+    }
+    void trimmedMarkersPreservePixels() {
+        for (double dpr:{1.0,1.25,1.5,2.0}) for (bool selected:{false,true})
+        for (int number:{1,9,16,32}) {
+            QImage marker(QSize(qCeil(36*dpr),qCeil(36*dpr)),QImage::Format_ARGB32_Premultiplied);
+            marker.setDevicePixelRatio(dpr); marker.fill(Qt::transparent);
+            { QPainter p(&marker); p.setRenderHint(QPainter::Antialiasing,true);
+              QFont font; font.setPixelSize(11); font.setBold(true); p.setFont(font);
+              const QColor color(195,145,231),background(17,24,32); const QPointF centre(18,18);
+              if (selected) { p.setPen(QPen(color,1)); p.setBrush(Qt::NoBrush); p.drawEllipse(centre,15,15); }
+              p.setPen(QPen(color,1.5)); p.setBrush(selected?color:background); p.drawEllipse(centre,10,10);
+              p.setPen(selected?background:color); p.drawText(QRectF(8,8,20,20),Qt::AlignCenter,QString::number(number)); }
+            const auto sprite=detail::markerSprite(marker);
+            if (dpr==1) QVERIFY(sprite.image.width()<marker.width());
+            else QCOMPARE(sprite.image,marker);
+            for (double fraction:{0.0,0.2,0.5,0.8}) {
+                QImage reference(QSize(qCeil(120*dpr),qCeil(80*dpr)),QImage::Format_RGB32);
+                reference.setDevicePixelRatio(dpr); reference.fill(QColor(58,149,149)); QImage cropped=reference;
+                const QPointF position(60+fraction,40+fraction);
+                { QPainter p(&reference); p.setRenderHint(QPainter::Antialiasing,true);
+                  p.drawImage(position-QPointF(18,18),marker); }
+                { QPainter p(&cropped); p.setRenderHint(QPainter::Antialiasing,true);
+                  p.drawImage(position+sprite.offset,sprite.image); }
+                QVERIFY2(cropped==reference,qPrintable(QString("trim differs: dpr=%1 selected=%2 number=%3 fraction=%4")
+                    .arg(dpr).arg(selected).arg(number).arg(fraction)));
+            }
+        }
+    }
     void eqAndFooterDamageCoversEveryChangedPixel() {
         DamageTrackingWidget widget; widget.resize(800,480); widget.setSpectrumEnabled(false);
         std::vector<Band> bands(4);
@@ -398,21 +453,32 @@ private slots:
         for (auto v:result) QCOMPARE(v,-120.0f);
     }
     void mailboxConcurrency() {
-        SpectrumMailbox mailbox; std::atomic<bool> done{false};
+        SpectrumMailbox mailbox; std::atomic<bool> done{false},consumerStopped{false};
+        bool finalPublished=false;
         std::thread producer([&] {
             std::array<float,1025> bins;
             for (int frame=0;frame<10000;++frame) {
                 bins.fill(float(frame)); mailbox.publish(bins.data(),int(bins.size()),48000);
             }
             done.store(true);
+            // A single-core scheduler may run the whole producer while the
+            // consumer is preempted holding its try-lock. Verify a final
+            // coherent frame without depending on that scheduling accident.
+            while (!consumerStopped.load()) std::this_thread::yield();
+            bins.fill(10000);
+            finalPublished=mailbox.publish(bins.data(),int(bins.size()),48000);
         });
         SpectrumFrame frame; bool torn=false; int received=0;
         while (!done.load()) if (mailbox.takeLatest(frame)) {
             ++received;
             for (int i=1;i<frame.count;++i) torn=torn || frame.db[i]!=frame.db[0];
         }
-        producer.join();
-        if (mailbox.takeLatest(frame)) ++received;
+        consumerStopped.store(true); producer.join();
+        QVERIFY(finalPublished);
+        if (mailbox.takeLatest(frame)) {
+            ++received;
+            for (int i=0;i<frame.count;++i) torn=torn || frame.db[i]!=10000;
+        }
         QVERIFY(received>0); QVERIFY(!torn);
     }
     void mouseAndQSlider() {

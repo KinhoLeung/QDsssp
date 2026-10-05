@@ -35,7 +35,7 @@ if(QDSSSP_ENABLE_PIPEWIRE)
 endif()
 
 add_library(qdsssp STATIC
-    src/eq_response.cpp src/spectrum.cpp src/audio_spectrum.cpp src/spectrum_fft.h src/eq_widget.cpp src/response_path.h src/overlay_region.h src/footer_text.h src/filter_icon.cpp assets/dsssp.qrc
+    src/eq_response.cpp src/spectrum.cpp src/audio_spectrum.cpp src/spectrum_fft.h src/eq_widget.cpp src/response_path.h src/overlay_region.h src/footer_text.h src/marker_sprite.h src/filter_icon.cpp assets/dsssp.qrc
     include/qdsssp/eq_response.h include/qdsssp/spectrum.h include/qdsssp/audio_spectrum.h
     include/qdsssp/eq_widget.h include/qdsssp/filter_icon.h)
 target_include_directories(qdsssp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

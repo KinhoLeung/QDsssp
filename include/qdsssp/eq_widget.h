@@ -14,6 +14,7 @@
 #include <memory>
 
 namespace qdsssp {
+namespace detail { class FooterTextCache; }
 
 // Opt-in diagnostics; samples are bounded and allocated only when profiling.
 struct TimingSamples {
@@ -131,8 +132,10 @@ private:
     QRect overlayInk_;
     QRectF overlayClip_;
     QFont overlayFont_, footerFont_;
+    QRect footerQLabelBounds_;
+    std::unique_ptr<detail::FooterTextCache> footerTextCache_;
     QColor overlayBandFillColor_;
-    struct OverlayMarker { QPointF position; QImage image; };
+    struct OverlayMarker { QPointF position,offset; QImage image; };
     std::array<OverlayMarker, ResponseCache::MaxBands> overlayMarkers_;
     int overlayMarkerCount_ = 0, overlaySelection_ = -1;
     bool overlayAntialiasing_ = true, overlayExternalCoefficients_ = false;
@@ -146,6 +149,7 @@ private:
     double footerQ_ = -1;
     bool footerEditable_ = false;
     std::array<QImage, ResponseCache::MaxBands> markers_;
+    std::array<QPointF, ResponseCache::MaxBands> markerOffsets_;
     std::array<int, ResponseCache::MaxBands> markerStyles_{};
     std::array<bool, ResponseCache::MaxBands> markerDirty_{};
     QPainterPath sumPath_, bandPath_, bandFillPath_, spectrumPath_;

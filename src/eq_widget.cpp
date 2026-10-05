@@ -3,7 +3,9 @@
 #include "response_path.h"
 #include "overlay_region.h"
 #include "footer_text.h"
+#include "marker_sprite.h"
 #include <QHideEvent>
+#include <QFontMetrics>
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPaintEvent>
@@ -30,6 +32,7 @@ QString frequencyLabel(double hz) {
 }
 
 EqWidget::EqWidget(QWidget *parent) : QWidget(parent), mailbox_(std::make_shared<SpectrumMailbox>()) {
+    footerTextCache_.reset(new detail::FooterTextCache);
     setAttribute(Qt::WA_OpaquePaintEvent);
     setAttribute(Qt::WA_AcceptTouchEvents);
     setFocusPolicy(Qt::StrongFocus);
@@ -412,6 +415,7 @@ void EqWidget::prepareOverlay() {
         if (i<overlayMarkerCount_) markerDamage=markerDamage.united(markerBounds(overlayMarkers_[i].position));
         overlayMarkers_[i].position=bandPosition(i);
         overlayMarkers_[i].image=markerImage(i);
+        overlayMarkers_[i].offset=markerOffsets_[i];
         markerDamage=markerDamage.united(markerBounds(overlayMarkers_[i].position));
     }
     for (int i=count;i<overlayMarkerCount_;++i) {
@@ -512,6 +516,9 @@ const QImage &EqWidget::markerImage(int i) {
     if (active) { p.setPen(QPen(color,1)); p.setBrush(Qt::NoBrush); p.drawEllipse(pos,15,15); }
     p.setPen(QPen(color,1.5)); p.setBrush(active?color:background); p.drawEllipse(pos,10,10);
     p.setPen(active?background:color); p.drawText(QRectF(8,8,20,20),Qt::AlignCenter,QString::number(i+1));
+    p.end();
+    const auto sprite=detail::markerSprite(image);
+    image=sprite.image; markerOffsets_[i]=sprite.offset;
     return image;
 }
 
@@ -530,7 +537,7 @@ void EqWidget::paintOverlay(QPainter &p,const QRegion *damage) {
         const auto &marker=overlayMarkers_[i];
         if (damage && !damage->intersects(QRectF(marker.position-QPointF(18,18),QSizeF(36,36))
                                           .toAlignedRect().adjusted(-1,-1,1,1))) continue;
-        p.drawImage(marker.position-QPointF(18,18),marker.image);
+        p.drawImage(marker.position+marker.offset,marker.image);
     }
     if (overlayExternalCoefficients_) {
         QFont f=overlayFont_;
@@ -550,6 +557,9 @@ void EqWidget::rebuildFooter() {
     if (!footerValid_) {
         // Reuse the adjusted font and its resolved engine throughout edits.
         footerFont_=font(); footerFont_.setBold(false); footerFont_.setPixelSize(13);
+        const QRectF label(12,qControlRect().center().y()-12,28,24);
+        footerQLabelBounds_=QFontMetricsF(footerFont_,&background_)
+            .boundingRect(label,Qt::AlignCenter,QStringLiteral("Q")).toAlignedRect().adjusted(-1,-1,1,1);
     }
     p.setFont(footerFont_); p.setPen(ink);
     const bool reset=!footerValid_ || footerSelection_!=selected_;
@@ -566,7 +576,7 @@ void EqWidget::rebuildFooter() {
         if (reset || info!=footerText_) {
             const QRect area(48,height()-76,width()-48,24);
             p.fillRect(area,background); damage+=area;
-            detail::drawFooterText(p,QRectF(48,height()-75,width()-96,22),info,font());
+            detail::drawFooterText(p,QRectF(48,height()-75,width()-96,22),info,font(),footerTextCache_.get());
         }
         footerText_=info;
         const int sign=(b.gainDb>0)-(b.gainDb<0);
@@ -587,7 +597,10 @@ void EqWidget::rebuildFooter() {
             }
             damage+=area;
             p.save(); p.setClipRect(area,Qt::IntersectClip); p.fillRect(area,background);
-            p.setPen(editable?ink:muted); p.drawText(QRectF(12,y-12,28,24),Qt::AlignCenter,"Q");
+            const QRectF label(12,y-12,28,24);
+            if (area.intersects(footerQLabelBounds_)) {
+                p.setPen(editable?ink:muted); p.drawText(label,Qt::AlignCenter,"Q");
+            }
             p.setPen(QPen(grid,4,Qt::SolidLine,Qt::RoundCap)); p.drawLine(QPointF(qr.left(),y),QPointF(qr.right(),y));
             p.setPen(QPen(editable?bandColor(selected_):muted,4,Qt::SolidLine,Qt::RoundCap));
             p.drawLine(QPointF(qr.left(),y),QPointF(x,y)); p.setBrush(editable?bandColor(selected_):muted);
